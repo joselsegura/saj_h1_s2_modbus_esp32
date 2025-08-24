@@ -218,24 +218,17 @@ void setup_wifi_manager() {
   WiFi.onEvent(WiFiGotIP, ARDUINO_EVENT_WIFI_STA_GOT_IP);
   WiFi.onEvent(WiFiStationDisconnected, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
 
-  
   WiFiManager wm;
-
-  //reset settings - wipe stored credentials for testing
-  //wm.resetSettings();
+  wm.setConnectTimeout(300);
 
   bool res;
-  // res = wm.autoConnect(); // auto generated AP name from chipid
-  // res = wm.autoConnect("AutoConnectAP"); // anonymous ap
-  res = wm.autoConnect("ESP32_SAJ_MODBUS"); // password protected ap
+  res = wm.autoConnect("ESP32_SAJ_MODBUS");
 
   if(!res) {
-        Serial.println("Failed to connect");
-        // ESP.restart();
+    Serial.println("Failed to connect");
   } 
   else {
-      //if you get here you have connected to the WiFi    
-      Serial.println("connected...yeey :)");
+    Serial.println("connected...yeey :)");
   }
 }
 
