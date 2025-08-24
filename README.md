@@ -13,7 +13,7 @@ Perfect for integrating your SAJ inverter with **Home Assistant**, **OpenHAB**, 
 The ESP32 acts as a protocol translator:
 
 - **Receives** Modbus TCP requests on port 502
-- **Translates** them to SAJ's proprietary Bluetooth protocol  
+- **Translates** them to SAJ's proprietary Bluetooth protocol
 - **Forwards** requests to the inverter via Bluetooth
 - **Returns** responses back to the Modbus client
 
