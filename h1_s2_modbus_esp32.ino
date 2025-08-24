@@ -1,21 +1,21 @@
 /*
  * SAJ H1 S2 Modbus TCP Bridge for ESP32
- * 
- * This project enables Modbus TCP access to SAJ H1 S2 solar inverters by creating 
+ *
+ * This project enables Modbus TCP access to SAJ H1 S2 solar inverters by creating
  * a wireless bridge between Modbus TCP clients and the inverter's Bluetooth interface.
- * 
+ *
  * Copyright (c) 2024-2025 SAJ H1 S2 Modbus ESP32 Contributors
- * 
+ *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
  * in the Software without restriction, including without limitation the rights
  * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
  * copies of the Software, and to permit persons to whom the Software is
  * furnished to do so, subject to the following conditions:
- * 
+ *
  * The above copyright notice and this permission notice shall be included in all
  * copies or substantial portions of the Software.
- * 
+ *
  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
@@ -23,10 +23,10 @@
  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
- * 
+ *
  * Project Repository: https://github.com/sgsancho/saj_h1_s2_modbus_esp32
  * Community: https://t.me/saj_nooficialoriginal
- * 
+ *
  * DISCLAIMER: This is an unofficial, community-developed project.
  * It is not officially supported by SAJ and may stop working with firmware updates.
  * Use at your own risk.
@@ -429,7 +429,7 @@ void loop() {
           request.getNumberRegistersBytes()[1]
         };
 
-        UInt16 crc = (ModRTU_CRC((char*) modbus_message_final, 6));
+        UInt16 crc = ModRTU_CRC(reinterpret_cast<char*>(modbus_message_final), 6);
 
         unsigned char high_byte = crc >> 8;
         unsigned char low_byte = crc & 0xFF;
