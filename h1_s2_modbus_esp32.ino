@@ -1,3 +1,37 @@
+/*
+ * SAJ H1 S2 Modbus TCP Bridge for ESP32
+ * 
+ * This project enables Modbus TCP access to SAJ H1 S2 solar inverters by creating 
+ * a wireless bridge between Modbus TCP clients and the inverter's Bluetooth interface.
+ * 
+ * Copyright (c) 2024-2025 SAJ H1 S2 Modbus ESP32 Contributors
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ * 
+ * Project Repository: https://github.com/sgsancho/saj_h1_s2_modbus_esp32
+ * Community: https://t.me/saj_nooficialoriginal
+ * 
+ * DISCLAIMER: This is an unofficial, community-developed project.
+ * It is not officially supported by SAJ and may stop working with firmware updates.
+ * Use at your own risk.
+ */
+
 #include <WiFiManager.h>
 #include "BLEDevice.h"
 
@@ -46,6 +80,102 @@ int total_calls = 0;
 int total_errors = 0;
 
 uint64_t previousMillis_wifi = 0;
+
+
+class ModbusTCPRequest {
+ private:
+  // Modbus TCP header fields
+  byte transaction_identifier[2];
+  byte protocol_identifier[2];
+  byte length[2];
+  byte unit_id;
+  byte function_code;
+  byte address[2];
+  byte number_registers[2];
+
+ public:
+  // Constructor
+  ModbusTCPRequest() {}
+
+  // Static factory method to create object from byte array
+  static ModbusTCPRequest fromByteArray(const byte* request) {
+    ModbusTCPRequest modbus;
+
+    // Parse header fields
+    modbus.transaction_identifier[0] = request[0];
+    modbus.transaction_identifier[1] = request[1];
+    modbus.protocol_identifier[0] = request[2];
+    modbus.protocol_identifier[1] = request[3];
+    modbus.length[0] = request[4];
+    modbus.length[1] = request[5];
+    modbus.unit_id = request[6];
+    modbus.function_code = request[7];
+    modbus.address[0] = request[8];
+    modbus.address[1] = request[9];
+    modbus.number_registers[0] = request[10];
+    modbus.number_registers[1] = request[11];
+
+    return modbus;
+  }
+
+  // Getter methods for accessing parsed fields
+  byte getFunctionCode() const { return function_code; }
+  byte getUnitId() const { return unit_id; }
+
+  uint16_t getTransactionId() const {
+    return (transaction_identifier[0] << 8) | transaction_identifier[1];
+  }
+
+  uint16_t getAddress() const {
+    return (address[0] << 8) | address[1];
+  }
+
+  uint16_t getNumberOfRegisters() const {
+    return (number_registers[0] << 8) | number_registers[1];
+  }
+
+  // Get raw byte arrays (by reference - no copying!)
+  const byte* getTransactionIdentifierBytes() const { return transaction_identifier; }
+  const byte* getProtocolIdentifierBytes() const { return protocol_identifier; }
+  const byte* getLengthBytes() const { return length; }
+  const byte* getAddressBytes() const { return address; }
+  const byte* getNumberRegistersBytes() const { return number_registers; }
+
+  // Debug method
+  void printDebugInfo() const {
+    Serial.println("");
+    Serial.print("modbus_transaction_identifier: ");
+    Serial.print(transaction_identifier[0]);
+    Serial.print(" ");
+    Serial.println(transaction_identifier[1]);
+
+    Serial.print("modbus_protocol_identifier: ");
+    Serial.print(protocol_identifier[0]);
+    Serial.print(" ");
+    Serial.println(protocol_identifier[1]);
+
+    Serial.print("modbus_length: ");
+    Serial.print(length[0]);
+    Serial.print(" ");
+    Serial.println(length[1]);
+
+    Serial.print("modbus_unit_id: ");
+    Serial.println(unit_id);
+
+    Serial.print("modbus_function_code: ");
+    Serial.println(function_code);
+
+    Serial.print("modbus_address: ");
+    Serial.print(address[0]);
+    Serial.print(" ");
+    Serial.println(address[1]);
+
+    Serial.print("modbus_number_registers: ");
+    Serial.print(number_registers[0]);
+    Serial.print(" ");
+    Serial.println(number_registers[1]);
+  }
+};
 
 void print_array(byte data[], int length, String title) {
     Serial.println("");
@@ -196,8 +326,6 @@ void WiFiStationDisconnected(WiFiEvent_t event, WiFiEventInfo_t info) {
   Serial.println(info.wifi_sta_disconnected.reason);
 }
 
-
-
 void setup_wifi_manager() {
   WiFi.disconnect(true);
 
@@ -278,16 +406,10 @@ void loop() {
 
         previousMillis = currentMillis;
         waitingmessage = true;
-        byteFN = mosbus_request[7];
+        ModbusTCPRequest request = ModbusTCPRequest::fromByteArray(mosbus_request);
+        request.printDebugInfo();
 
-        // Example from NodeRed of HA: 0, 1, 0, 0, 0, 6, 1, 3, 64, -94, 0, 1
-        byte modbus_transaction_identifier[2] = {(byte) mosbus_request[0], (byte) mosbus_request[1]};
-        byte modbus_protocol_identifier[2] = {(byte) mosbus_request[2], (byte) mosbus_request[3]};
-        byte modbus_length[2] = {(byte) mosbus_request[4], (byte) mosbus_request[5]};
-        byte modbus_unit_id = (byte) mosbus_request[6];
-        byte modbus_function_code = (byte) mosbus_request[7];
-        byte modbus_address[2] = {(byte) mosbus_request[8], (byte) mosbus_request[9]};
-        byte modbus_number_registers[2] = {(byte) mosbus_request[10], (byte) mosbus_request[11]};
+        byteFN = mosbus_request[7];
 
         Serial.println("");
         Serial.print("c: ");
@@ -296,54 +418,15 @@ void loop() {
         Serial.println("");
         Serial.print("total_calls: ");
         Serial.print(total_calls);
-
-        Serial.println("");
-
-        Serial.print("modbus_transaction_identifier: ");
-        Serial.print(modbus_transaction_identifier[0]);
-        Serial.print(" ");
-        Serial.print(modbus_transaction_identifier[1]);
-        Serial.println("");
-
-        Serial.print("modbus_protocol_identifier: ");
-        Serial.print(modbus_protocol_identifier[0]);
-        Serial.print(" ");
-        Serial.print(modbus_protocol_identifier[1]);
-        Serial.println("");
-
-        Serial.print("modbus_length: ");
-        Serial.print(modbus_length[0]);
-        Serial.print(" ");
-        Serial.print(modbus_length[1]);
-        Serial.println("");
-
-        Serial.print("modbus_unit_id: ");
-        Serial.print(modbus_unit_id);
-        Serial.println("");
-
-        Serial.print("modbus_function_code: ");
-        Serial.print(modbus_function_code);
-        Serial.println("");
-
-        Serial.print("modbus_address: ");
-        Serial.print(modbus_address[0]);
-        Serial.print(" ");
-        Serial.print(modbus_address[1]);
-        Serial.println("");
-
-        Serial.print("modbus_number_registers: ");
-        Serial.print(modbus_number_registers[0]);
-        Serial.print(" ");
-        Serial.print(modbus_number_registers[1]);
         Serial.println("");
 
         byte modbus_message_final[6] = {
-          (byte) modbus_unit_id,
-          (byte) modbus_function_code,
-          (byte) modbus_address[0],
-          (byte) modbus_address[1],
-          (byte) modbus_number_registers[0],
-          (byte) modbus_number_registers[1]
+          request.getUnitId(),
+          request.getFunctionCode(),
+          request.getAddressBytes()[0],
+          request.getAddressBytes()[1],
+          request.getNumberRegistersBytes()[0],
+          request.getNumberRegistersBytes()[1]
         };
 
         UInt16 crc = (ModRTU_CRC((char*) modbus_message_final, 6));
@@ -351,7 +434,9 @@ void loop() {
         unsigned char high_byte = crc >> 8;
         unsigned char low_byte = crc & 0xFF;
 
-        int transaction_identifier = ((modbus_transaction_identifier[0] << 8) +(modbus_transaction_identifier[1])) - 1;
+        int transaction_identifier = ((request.getTransactionIdentifierBytes()[0] << 8) +
+          (request.getTransactionIdentifierBytes()[1])) - 1;
+
         byte transaction_identifier_hex[2];
         transaction_identifier_hex[0] = (transaction_identifier & 0x0000ff00) >> 8;
         transaction_identifier_hex[1] = transaction_identifier & 0x000000ff;
@@ -362,17 +447,19 @@ void loop() {
           c,
           (byte) 9,
           (byte) 50,
-          (byte) modbus_unit_id,  // modbus_unit_id
-          (byte) modbus_function_code,  // modbus_function_code
-          (byte) modbus_address[0],  // modbus_address
-          (byte) modbus_address[1],  // modbus_address
-          (byte) modbus_number_registers[0],  // modbus_number_registers
-          (byte) modbus_number_registers[1],  // modbus_number_registers
+          request.getUnitId(),  // modbus_unit_id
+          request.getFunctionCode(),  // modbus_function_code
+          request.getAddressBytes()[0],  // modbus_address
+          request.getAddressBytes()[1],  // modbus_address
+          request.getNumberRegistersBytes()[0],  // modbus_number_registers
+          request.getNumberRegistersBytes()[1],  // modbus_number_registers
           (byte) low_byte,  // crc
           (byte) high_byte  // crc
         };
 
-        total_registros = ((modbus_number_registers[0] << 8) +(modbus_number_registers[1]) * 2) + 3;
+        total_registros = ((request.getNumberRegistersBytes()[0] << 8) +
+          (request.getNumberRegistersBytes()[1]) * 2) + 3;
+
         byte total_registros_hex[2];
         total_registros_hex[0] = (total_registros & 0x0000ff00) >> 8;
         total_registros_hex[1] = total_registros & 0x000000ff;
