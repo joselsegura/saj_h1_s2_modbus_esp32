@@ -35,8 +35,14 @@
 #include <WiFiManager.h>
 #include "BLEDevice.h"
 
-uint64_t previousMillis = 0;
-uint64_t previousMillistry = 0;
+//////// Required for Modbus TCP / IP //////////
+#define MB_FC_NONE 0
+#define MB_FC_READ_REGISTERS 3  // implemented
+#define MB_FC_WRITE_REGISTER 6  // implemented
+
+#define MODBUS_TCP_PORT 502
+
+void(* resetFunc) (void) = 0;  // declare reset function @ address 0
 
 static BLEUUID serviceUUID("0000ffff-0000-1000-8000-00805f9b34fb");
 static BLEUUID charUUIDw("0000ff01-0000-1000-8000-00805f9b34fb");
@@ -50,36 +56,18 @@ static BLERemoteCharacteristic* pRemoteCharacteristicw;
 static BLEAdvertisedDevice* myDevice;
 
 BLEClient*  pClient  = BLEDevice::createClient();
+WiFiClient client;
+WiFiServer MBServer(MODBUS_TCP_PORT);
 
-bool errorr = false;
+uint64_t previousMillistry = 0;
+uint64_t previousMillis_wifi = 0;
 bool waitingmessage = false;
-
-int soft = 0;
+byte transaction_id = 0;
+byte mosbus_request[260];
 byte modbus_frame_response[8];
 int total_registros;
-
-#define UInt16 uint16_t
-
-int ModbusTCP_port = 502;
-WiFiServer MBServer(ModbusTCP_port);
-
-//////// Required for Modbus TCP / IP //////////
-#define MB_FC_NONE 0
-#define MB_FC_READ_REGISTERS 3  // implemented
-#define MB_FC_WRITE_REGISTER 6  // implemented
-
-WiFiClient client;
-byte mosbus_request[260];
-
 int errlen = 0;
-
-void(* resetFunc) (void) = 0;  // declare reset function @ address 0
-
-byte c = 0;
 int total_calls = 0;
-int total_errors = 0;
-
-uint64_t previousMillis_wifi = 0;
 
 
 class ModbusTCPRequest {
@@ -177,7 +165,7 @@ class ModbusTCPRequest {
   }
 
   // Calculate ModRTU CRC for this modbus request
-  UInt16 getModRTU_CRC() const {
+  uint16_t getModRTU_CRC() const {
     byte modbus_message_final[6] = {
       unit_id,
       function_code,
@@ -187,10 +175,10 @@ class ModbusTCPRequest {
       number_registers[1]
     };
 
-    UInt16 crc = 0xFFFF;
+    uint16_t crc = 0xFFFF;
 
     for (int pos = 0; pos < 6; pos++) {
-      crc ^= (UInt16)modbus_message_final[pos];  // XOR byte into least sig. byte of crc
+      crc ^= (uint16_t)modbus_message_final[pos];  // XOR byte into least sig. byte of crc
 
       for (int i = 8; i != 0; i--) {    // Loop over each bit
         if ((crc & 0x0001) != 0) {      // If the LSB is set
@@ -204,6 +192,28 @@ class ModbusTCPRequest {
 
     // Note, this number has low and high bytes swapped, so use it accordingly (or swap bytes)
     return crc;
+  }
+};
+
+class MyClientCallback : public BLEClientCallbacks {
+  void onConnect(BLEClient* pclient) {}
+
+  void onDisconnect(BLEClient* pclient) {
+    Serial.println("Reset 2. Bluetooth client disconnected");
+    resetFunc();
+  }
+};
+
+/* Scan for BLE servers and find the first one that advertises the service we are looking for.*/
+class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
+  /* Called for each advertising BLE server. */
+  void onResult(BLEAdvertisedDevice advertisedDevice) {
+    if (advertisedDevice.haveServiceUUID() && advertisedDevice.isAdvertisingService(serviceUUID)) {
+      BLEDevice::getScan()->stop();
+      myDevice = new BLEAdvertisedDevice(advertisedDevice);
+      doConnect_ble = true;
+      doScan_ble = true;
+    }
   }
 };
 
@@ -266,15 +276,6 @@ static void notifyCallback(
   }
 }
 
-class MyClientCallback : public BLEClientCallbacks {
-  void onConnect(BLEClient* pclient) {}
-
-  void onDisconnect(BLEClient* pclient) {
-    Serial.println("Reset 2. Bluetooth client disconnected");
-    resetFunc();
-  }
-};
-
 bool connectToServer_ble() {
   BLEDevice::getScan()->stop();
   connected_ble = true;
@@ -319,22 +320,9 @@ bool connectToServer_ble() {
   if (pRemoteCharacteristic->canNotify())
     pRemoteCharacteristic->registerForNotify(notifyCallback);
 
-  soft = 0;
   doConnect_ble = false;
   return true;
 }
-/* Scan for BLE servers and find the first one that advertises the service we are looking for.*/
-class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
-  /* Called for each advertising BLE server. */
-  void onResult(BLEAdvertisedDevice advertisedDevice) {
-    if (advertisedDevice.haveServiceUUID() && advertisedDevice.isAdvertisingService(serviceUUID)) {
-      BLEDevice::getScan()->stop();
-      myDevice = new BLEAdvertisedDevice(advertisedDevice);
-      doConnect_ble = true;
-      doScan_ble = true;
-    }
-  }
-};
 
 void WiFiStationConnected(WiFiEvent_t event, WiFiEventInfo_t info) {
   Serial.println("Connected to WIFI successfully!");
@@ -346,7 +334,7 @@ void WiFiGotIP(WiFiEvent_t event, WiFiEventInfo_t info) {
   Serial.print("IP address: ");
   Serial.print(WiFi.localIP());
   Serial.print(":");
-  Serial.println(String(ModbusTCP_port));
+  Serial.println(MODBUS_TCP_PORT);
   Serial.println("Modbus TCP/IP Online");
 }
 
@@ -410,8 +398,6 @@ void loop() {
       Serial.println("We have failed to connect to the server; there is nothin more we will do.");
   }
 
-  uint64_t currentMillis = millis();
-
   if (connected_ble) {
       client = MBServer.accept();
       if (!client)
@@ -422,9 +408,6 @@ void loop() {
       // Modbus TCP/IP
       while (client.connected()) {
       if (client.available()) {
-        if (c > 255)
-          c = 0;
-
         Serial.println("client.available");
         int i = 0;
         while (client.available()) {
@@ -434,7 +417,6 @@ void loop() {
         client.clear();
         Serial.println("TCP request received");
 
-        previousMillis = currentMillis;
         waitingmessage = true;
         ModbusTCPRequest request = ModbusTCPRequest::fromByteArray(mosbus_request);
         request.printDebugInfo();
@@ -442,15 +424,15 @@ void loop() {
         byteFN = mosbus_request[7];
 
         Serial.println("");
-        Serial.print("c: ");
-        Serial.print(c);
+        Serial.print("transaction_id: ");
+        Serial.print(transaction_id);
 
         Serial.println("");
         Serial.print("total_calls: ");
         Serial.print(total_calls);
         Serial.println("");
 
-        UInt16 crc = request.getModRTU_CRC();
+        uint16_t crc = request.getModRTU_CRC();
 
         unsigned char high_byte = crc >> 8;
         unsigned char low_byte = crc & 0xFF;
@@ -465,7 +447,7 @@ void loop() {
         byte mosbus_request_final[13] = {
         (byte) 77,
           0,
-          c,
+          transaction_id,
           (byte) 9,
           (byte) 50,
           request.getUnitId(),  // modbus_unit_id
@@ -523,8 +505,8 @@ void loop() {
             break;
           }
 
-          c = c+1;
-          total_calls = total_calls +1;
+          transaction_id++;
+          total_calls++;
         }
       }
   } else if (doScan_ble) {
