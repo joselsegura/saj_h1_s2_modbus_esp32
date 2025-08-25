@@ -175,6 +175,36 @@ class ModbusTCPRequest {
     Serial.print(" ");
     Serial.println(number_registers[1]);
   }
+
+  // Calculate ModRTU CRC for this modbus request
+  UInt16 getModRTU_CRC() const {
+    byte modbus_message_final[6] = {
+      unit_id,
+      function_code,
+      address[0],
+      address[1],
+      number_registers[0],
+      number_registers[1]
+    };
+
+    UInt16 crc = 0xFFFF;
+
+    for (int pos = 0; pos < 6; pos++) {
+      crc ^= (UInt16)modbus_message_final[pos];  // XOR byte into least sig. byte of crc
+
+      for (int i = 8; i != 0; i--) {    // Loop over each bit
+        if ((crc & 0x0001) != 0) {      // If the LSB is set
+          crc >>= 1;                    // Shift right and XOR 0xA001
+          crc ^= 0xA001;
+        } else {                           // Else LSB is not set
+          crc >>= 1;                    // Just shift right
+        }
+      }
+    }
+
+    // Note, this number has low and high bytes swapped, so use it accordingly (or swap bytes)
+    return crc;
+  }
 };
 
 void print_array(byte data[], int length, String title) {
@@ -420,16 +450,7 @@ void loop() {
         Serial.print(total_calls);
         Serial.println("");
 
-        byte modbus_message_final[6] = {
-          request.getUnitId(),
-          request.getFunctionCode(),
-          request.getAddressBytes()[0],
-          request.getAddressBytes()[1],
-          request.getNumberRegistersBytes()[0],
-          request.getNumberRegistersBytes()[1]
-        };
-
-        UInt16 crc = ModRTU_CRC(reinterpret_cast<char*>(modbus_message_final), 6);
+        UInt16 crc = request.getModRTU_CRC();
 
         unsigned char high_byte = crc >> 8;
         unsigned char low_byte = crc & 0xFF;
@@ -512,24 +533,4 @@ void loop() {
     doConnect_ble = true;
     connected_ble = false;
   }
-}
-
-UInt16 ModRTU_CRC(char * buf, int len) {
-  UInt16 crc = 0xFFFF;
-
-  for (int pos = 0; pos < len; pos++) {
-    crc ^= (UInt16)buf[pos];          // XOR byte into least sig. byte of crc
-
-    for (int i = 8; i != 0; i--) {    // Loop over each bit
-      if ((crc & 0x0001) != 0) {      // If the LSB is set
-        crc >>= 1;                    // Shift right and XOR 0xA001
-        crc ^= 0xA001;
-      } else {                           // Else LSB is not set
-        crc >>= 1;                    // Just shift right
-      }
-    }
-  }
-
-  // Note, this number has low and high bytes swapped, so use it accordingly (or swap bytes)
-  return crc;
 }
