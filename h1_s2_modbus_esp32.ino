@@ -32,6 +32,7 @@
  * Use at your own risk.
  */
 
+#include <array>
 #include <WiFiManager.h>
 #include "BLEDevice.h"
 
@@ -42,36 +43,34 @@
 
 #define MODBUS_TCP_PORT 502
 
+// Defines for Modbus BLE
+#define BLE_HEADER_LENGTH 7
+
+// Timeouts
+#define WIFI_DISCONNECTED_UNTIL_RESET_TIMEOUT 30000
+
 void(* resetFunc) (void) = 0;  // declare reset function @ address 0
 
-static BLEUUID serviceUUID("0000ffff-0000-1000-8000-00805f9b34fb");
-static BLEUUID charUUIDw("0000ff01-0000-1000-8000-00805f9b34fb");
-static BLEUUID charUUID("0000ff02-0000-1000-8000-00805f9b34fb");
 
-static boolean doConnect_ble = false;
-static boolean connected_ble = false;
-static boolean doScan_ble = false;
-static BLERemoteCharacteristic* pRemoteCharacteristic;
-static BLERemoteCharacteristic* pRemoteCharacteristicw;
-static BLEAdvertisedDevice* myDevice;
+static BLEUUID saj_service_uuid("0000ffff-0000-1000-8000-00805f9b34fb");
+static BLEUUID saj_write_characteristic_uuid("0000ff01-0000-1000-8000-00805f9b34fb");
+static BLEUUID saj_notify_characteristic_uuid("0000ff02-0000-1000-8000-00805f9b34fb");
 
-BLEClient*  pClient  = BLEDevice::createClient();
 WiFiClient client;
-WiFiServer MBServer(MODBUS_TCP_PORT);
-
-uint64_t previousMillistry = 0;
-uint64_t previousMillis_wifi = 0;
-bool waitingmessage = false;
-byte transaction_id = 0;
-byte mosbus_request[260];
-byte modbus_frame_response[8];
-int total_registros;
-int errlen = 0;
-int total_calls = 0;
+WiFiServer modbus_tcp_server(MODBUS_TCP_PORT);
 
 
-class ModbusTCPRequest {
- private:
+// forward declaration
+void handleBleInverterResponse(
+  BLERemoteCharacteristic* pBLERemoteCharacteristic,
+  uint8_t* pData,
+  size_t length,
+  bool isNotify
+);
+
+
+class ModbusTCP {
+ protected:
   // Modbus TCP header fields
   byte transaction_identifier[2];
   byte protocol_identifier[2];
@@ -83,11 +82,11 @@ class ModbusTCPRequest {
 
  public:
   // Constructor
-  ModbusTCPRequest() {}
+  ModbusTCP() {}
 
   // Static factory method to create object from byte array
-  static ModbusTCPRequest fromByteArray(const byte* request) {
-    ModbusTCPRequest modbus;
+  static ModbusTCP fromByteArray(const std::vector<byte>& request) {
+    ModbusTCP modbus;
 
     // Parse header fields
     modbus.transaction_identifier[0] = request[0];
@@ -111,7 +110,7 @@ class ModbusTCPRequest {
   byte getUnitId() const { return unit_id; }
 
   uint16_t getTransactionId() const {
-    return (transaction_identifier[0] << 8) | transaction_identifier[1];
+    return (transaction_identifier[0] << 8) + transaction_identifier[1] - 1;
   }
 
   uint16_t getAddress() const {
@@ -119,7 +118,7 @@ class ModbusTCPRequest {
   }
 
   uint16_t getNumberOfRegisters() const {
-    return (number_registers[0] << 8) | number_registers[1];
+    return (number_registers[0] << 8) + (2 * number_registers[1]) + 3;
   }
 
   // Get raw byte arrays (by reference - no copying!)
@@ -163,6 +162,68 @@ class ModbusTCPRequest {
     Serial.print(" ");
     Serial.println(number_registers[1]);
   }
+};
+
+class ModbusTCPResponse : public ModbusTCP {
+ private:
+  std::vector<byte> data;
+
+ public:
+  // Static factory method to create object from byte array
+  static ModbusTCPResponse fromModbusTCP(const ModbusTCP& modbus_msg) {
+    ModbusTCPResponse response;
+
+    const byte *transaction_identifier = modbus_msg.getTransactionIdentifierBytes();
+    const byte *protocol_identifier = modbus_msg.getProtocolIdentifierBytes();
+    const byte *address = modbus_msg.getAddressBytes();
+    uint16_t number_registers = modbus_msg.getNumberOfRegisters();
+    const byte *number_register_bytes = modbus_msg.getNumberRegistersBytes();
+
+    // Copy header fields
+    response.transaction_identifier[0] = transaction_identifier[0];
+    response.transaction_identifier[1] = transaction_identifier[1];
+    response.protocol_identifier[0] = protocol_identifier[0];
+    response.protocol_identifier[1] = protocol_identifier[1];
+    response.length[0] = (number_registers & 0x0000ff00) >> 8;
+    response.length[1] = number_registers & 0x000000ff;
+    response.unit_id = modbus_msg.getUnitId();
+    response.function_code = modbus_msg.getFunctionCode();
+    response.number_registers[0] = number_register_bytes[0];
+    response.number_registers[1] = number_register_bytes[1];
+
+    return response;
+  }
+
+  void setData(const std::vector<byte>& data) { this->data = data; }
+
+  std::vector<byte> toByteVector() const {
+    std::vector<byte> response = {
+      transaction_identifier[0],
+      transaction_identifier[1],
+      protocol_identifier[0],
+      protocol_identifier[1],
+      length[0],
+      length[1],
+      unit_id,
+      function_code
+    };
+
+    response.insert(response.end(), data.begin(), data.end());
+    return response;
+  }
+};
+
+class ModbusBLERequest {
+ private:
+  static byte ble_transaction_id;
+
+  // Modbus BLUE header fields
+  byte ble_transaction_identifier;
+  byte transaction_identifier[2];
+  byte unit_id;
+  byte function_code;
+  byte address[2];
+  byte number_registers[2];
 
   // Calculate ModRTU CRC for this modbus request
   uint16_t getModRTU_CRC() const {
@@ -193,6 +254,66 @@ class ModbusTCPRequest {
     // Note, this number has low and high bytes swapped, so use it accordingly (or swap bytes)
     return crc;
   }
+
+ public:
+  static ModbusBLERequest fromModbusTCP(const ModbusTCP& request) {
+    ModbusBLERequest modbus;
+
+    modbus.ble_transaction_identifier = ModbusBLERequest::ble_transaction_id;
+    modbus.transaction_identifier[0] = request.getTransactionIdentifierBytes()[0];
+    modbus.transaction_identifier[1] = request.getTransactionIdentifierBytes()[1];
+    modbus.unit_id = request.getUnitId();
+    modbus.function_code = request.getFunctionCode();
+    modbus.address[0] = request.getAddressBytes()[0];
+    modbus.address[1] = request.getAddressBytes()[1];
+    modbus.number_registers[0] = request.getNumberRegistersBytes()[0];
+    modbus.number_registers[1] = request.getNumberRegistersBytes()[1];
+
+    ModbusBLERequest::ble_transaction_id++;
+
+    return modbus;
+  }
+
+  std::array<byte, 13> toByteArray() const {
+    uint16_t crc = getModRTU_CRC();
+    byte high_byte = crc >> 8;
+    byte low_byte = crc & 0xFF;
+    
+    std::array<byte, 13> request = {
+      77,
+      0,
+      ble_transaction_identifier,
+      9,
+      50,
+      unit_id,
+      function_code,
+      address[0],
+      address[1],
+      number_registers[0],
+      number_registers[1],
+      low_byte,
+      high_byte,
+    };
+
+    return request;
+  }
+};
+
+class ModbusBLEResponse {
+ private:
+  std::vector<byte> data;
+
+ public:
+  static ModbusBLEResponse fromByteArray(byte* data, size_t length) {
+    ModbusBLEResponse response;
+    size_t data_length = data[BLE_HEADER_LENGTH] + 1;
+    byte *data_start_ptr = data + BLE_HEADER_LENGTH;
+    response.data.assign(data_start_ptr, data_start_ptr + data_length);
+
+    return response;
+  }
+
+  std::vector<byte>& getData() { return data; }
 };
 
 class MyClientCallback : public BLEClientCallbacks {
@@ -204,133 +325,296 @@ class MyClientCallback : public BLEClientCallbacks {
   }
 };
 
-/* Scan for BLE servers and find the first one that advertises the service we are looking for.*/
-class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
-  /* Called for each advertising BLE server. */
-  void onResult(BLEAdvertisedDevice advertisedDevice) {
-    if (advertisedDevice.haveServiceUUID() && advertisedDevice.isAdvertisingService(serviceUUID)) {
-      BLEDevice::getScan()->stop();
-      myDevice = new BLEAdvertisedDevice(advertisedDevice);
-      doConnect_ble = true;
-      doScan_ble = true;
+/**
+ * BLE Connection Manager
+ * Manages the entire BLE lifecycle: scanning, discovery, connection, and state management
+ */
+class SajInverterBleManager {
+ public:
+  enum ConnectionState {
+    DISCONNECTED,
+    SCANNING,
+    DEVICE_FOUND,
+    CONNECTING,
+    CONNECTED,
+    CONNECTION_FAILED
+  };
+
+ private:
+  ConnectionState current_state;
+  BLEClient* ble_client;
+  BLEAdvertisedDevice discovered_device;
+  BLERemoteCharacteristic* notify_characteristic;
+  BLERemoteCharacteristic* write_characteristic;
+  bool device_discovered;
+  
+  // Inner class for device discovery
+  class InverterDiscovery : public BLEAdvertisedDeviceCallbacks {
+   private:
+    SajInverterBleManager* manager;
+    
+   public:
+    InverterDiscovery(SajInverterBleManager* mgr) : manager(mgr) {}
+    
+    void onResult(BLEAdvertisedDevice advertisedDevice) override {
+      if (advertisedDevice.haveServiceUUID() && 
+          advertisedDevice.isAdvertisingService(saj_service_uuid)) {
+        Serial.println("SAJ Inverter found!");
+        BLEDevice::getScan()->stop();
+        manager->onDeviceDiscovered(advertisedDevice);
+      }
+    }
+  };
+  
+  // Inner class for client callbacks
+  class ClientCallbacks : public BLEClientCallbacks {
+   private:
+    SajInverterBleManager* manager;
+    
+   public:
+    ClientCallbacks(SajInverterBleManager* mgr) : manager(mgr) {}
+    
+    void onConnect(BLEClient* client) override {
+      Serial.println("BLE Client connected");
+    }
+    
+    void onDisconnect(BLEClient* client) override {
+      Serial.println("BLE Client disconnected - resetting system");
+      manager->current_state = DISCONNECTED;
+      resetFunc();
+    }
+  };
+
+public:
+  SajInverterBleManager() : 
+    current_state(DISCONNECTED),
+    ble_client(nullptr),
+    notify_characteristic(nullptr),
+    write_characteristic(nullptr),
+    device_discovered(false) {
+  }
+  
+  void initialize() {
+    Serial.println("Initializing BLE Manager...");
+    BLEDevice::init("");
+    ble_client = BLEDevice::createClient();
+    ble_client->setClientCallbacks(new ClientCallbacks(this));
+    current_state = DISCONNECTED;
+  }
+  
+  void startScanning() {
+    if (current_state != DISCONNECTED && current_state != CONNECTION_FAILED) {
+      return; // Already scanning or connected
+    }
+    
+    Serial.println("Starting BLE scan for SAJ inverter...");
+    current_state = SCANNING;
+    device_discovered = false;
+    
+    BLEScan* scanner = BLEDevice::getScan();
+    scanner->setAdvertisedDeviceCallbacks(new InverterDiscovery(this));
+    scanner->setInterval(1349);
+    scanner->setWindow(449);
+    scanner->setActiveScan(true);
+    scanner->start(5000, false);
+  }
+  
+  void onDeviceDiscovered(BLEAdvertisedDevice& device) {
+    discovered_device = device;
+    device_discovered = true;
+    current_state = DEVICE_FOUND;
+    Serial.println("Device discovered, will connect on next update");
+  }
+  
+  void update() {
+    switch (current_state) {
+      case DISCONNECTED:
+      case CONNECTION_FAILED:
+        startScanning();
+        break;
+        
+      case SCANNING:
+        // Wait for discovery callback
+        break;
+        
+      case DEVICE_FOUND:
+        attemptConnection();
+        break;
+        
+      case CONNECTING:
+        // Connection in progress
+        break;
+        
+      case CONNECTED:
+        // Nothing to do, stay connected
+        break;
+    }
+  }
+  
+  bool isConnected() const {
+    return current_state == CONNECTED;
+  }
+  
+  bool isReady() const {
+    return isConnected() && notify_characteristic && write_characteristic;
+  }
+  
+  ConnectionState getState() const {
+    return current_state;
+  }
+  
+  const char* getStateString() const {
+    switch (current_state) {
+      case DISCONNECTED: return "DISCONNECTED";
+      case SCANNING: return "SCANNING";
+      case DEVICE_FOUND: return "DEVICE_FOUND";
+      case CONNECTING: return "CONNECTING";
+      case CONNECTED: return "CONNECTED";
+      case CONNECTION_FAILED: return "CONNECTION_FAILED";
+      default: return "UNKNOWN";
+    }
+  }
+  
+  bool writeToInverter(const uint8_t* data, size_t length) {
+    if (!isReady()) {
+      Serial.println("BLE Manager not ready for writing");
+      return false;
+    }
+    
+    return write_characteristic->writeValue(const_cast<uint8_t*>(data), length, true);
+  }
+
+private:
+  void attemptConnection() {
+    if (!device_discovered) {
+      current_state = CONNECTION_FAILED;
+      return;
+    }
+    
+    Serial.println("Attempting BLE connection...");
+    current_state = CONNECTING;
+    
+    try {
+      // Connect to device
+      if (!ble_client->connect(&discovered_device)) {
+        Serial.println("Failed to connect to device");
+        current_state = CONNECTION_FAILED;
+        return;
+      }
+      
+      // Set MTU
+      ble_client->setMTU(512);
+      Serial.println("Connected to SAJ inverter");
+      
+      // Get service
+      BLERemoteService* service = ble_client->getService(saj_service_uuid);
+      if (!service) {
+        Serial.println("Failed to find service");
+        ble_client->disconnect();
+        current_state = CONNECTION_FAILED;
+        return;
+      }
+      
+      // Get characteristics
+      notify_characteristic = service->getCharacteristic(saj_notify_characteristic_uuid);
+      write_characteristic = service->getCharacteristic(saj_write_characteristic_uuid);
+      
+      if (!notify_characteristic || !write_characteristic) {
+        Serial.println("Failed to find characteristics");
+        ble_client->disconnect();
+        current_state = CONNECTION_FAILED;
+        return;
+      }
+      
+      // Register for notifications
+      if (notify_characteristic->canNotify()) {
+        notify_characteristic->registerForNotify(handleBleInverterResponse);
+      }
+      
+      current_state = CONNECTED;
+      Serial.println("BLE connection fully established");
+      
+    } catch (...) {
+      Serial.println("Exception during BLE connection");
+      current_state = CONNECTION_FAILED;
     }
   }
 };
 
-void print_array(byte data[], int length, String title) {
+
+// BLE Connection Manager - replaces all individual BLE global variables
+static SajInverterBleManager saj_ble_manager;
+static ModbusTCPResponse modbus_tcp_response;
+
+// Global vars
+static uint64_t wifi_disconnect_timestamp_ms = 0;
+static int errlen = 0;
+static int loop_iterations = 0;
+
+// Initialization of static members
+byte ModbusBLERequest::ble_transaction_id = 0;
+
+
+void print_array(const byte* data, int length, String title) {
     Serial.println("");
     String sdata = title + ": [";
-    for (int j = 0; j < length; j++)
-      sdata = sdata + (String)(int8_t) data[j]+",";
+    for (int j = 0; j < length - 1; j++)
+      sdata = sdata + (String) data[j] + ", ";
 
-    sdata = sdata + "]";
+    sdata = sdata + (String) data[length - 1] + "]";
     Serial.print(sdata);
     Serial.println("");
 }
 
-static void notifyCallback(
+void handleBleInverterResponse(
   BLERemoteCharacteristic* pBLERemoteCharacteristic,
   uint8_t* pData,
   size_t length,
   bool isNotify
 ) {
-  waitingmessage = false;
 
-  if (modbus_frame_response[7] == 6) {  // function code
+  if (modbus_tcp_response.getFunctionCode() == 6) {  // function code
     Serial.println("Update completed?");
     client.clear();
-  } else {
-    // Expected to receive the number of requested registers. In the response there are 7 more bytes than requested
-    if ((static_cast<int>(length) - 7) != total_registros) {
-      Serial.println("ERROR DETECTED");
-      errlen = errlen + 1;
-      String error_detail = (String)"Requested registers: " + total_registros + \
-        (String)". Received: " + (String)(length-7);
-      Serial.println(error_detail);
-      print_array(pData, length, "RESPONSE ERROR <25 BYTES");
-      if (errlen > 5) {
-        Serial.println("Reset 1. Multiple erroneous messages received (5)");
-        resetFunc();
-      } else {
-        previousMillistry = millis();
-      }
-    } else {
-      errlen = 0;
-      previousMillistry = millis();
-      int longitud = abs(pData[7]);  // 20
-      byte slice[longitud+1];
-      memcpy(slice, pData + 7, longitud+1);
-      slice[0] = longitud;
-
-      byte combined[longitud+9];
-      memcpy(combined, modbus_frame_response, 8);
-      memcpy(&combined[8], slice, longitud+1);
-
-      combined[1] = modbus_frame_response[1];
-
-      print_array(combined, length+8, "Response final");
-
-      client.write(combined, longitud+9);
-      client.clear();
+    return;
+  }
+  
+  // Expected to receive the number of requested registers. In the response there are 7 more bytes than requested
+  if ((static_cast<int>(length) - 7) != modbus_tcp_response.getNumberOfRegisters()) {
+    Serial.println("ERROR DETECTED");
+    errlen++;
+    String error_detail = (String)"Requested registers: " + modbus_tcp_response.getNumberOfRegisters() + \
+      (String)". Received: " + (String)(length-7);
+    Serial.println(error_detail);
+    print_array(pData, length, "RESPONSE ERROR <25 BYTES");
+    if (errlen > 5) {
+      Serial.println("Reset 1. Multiple erroneous messages received (5)");
+      resetFunc();
     }
-  }
+
+    return;
+  } 
+
+  errlen = 0;
+  print_array(pData, length, "data received from BLE");
+
+  ModbusBLEResponse ble_response = ModbusBLEResponse::fromByteArray(pData, length);
+  modbus_tcp_response.setData(ble_response.getData());
+  std::vector<byte> serialized_response = modbus_tcp_response.toByteVector();
+
+  client.write(serialized_response.data(), serialized_response.size());
+  client.clear();
 }
 
-bool connectToServer_ble() {
-  BLEDevice::getScan()->stop();
-  connected_ble = true;
+// Old connectToInverterBle function removed - functionality moved to SajInverterBleManager
 
-  Serial.println("Forming a connection to ");
-  previousMillistry = millis();
-  Serial.println(myDevice->getAddress().toString().c_str());
-
-  Serial.println(" - Created client");
-  pClient->setClientCallbacks(new MyClientCallback());
-
-  previousMillistry = millis();
-  pClient->connect(myDevice);
-  pClient->setMTU(512);  // mtu size equals packet limit-3 250
-  Serial.println(" - Connected to server");
-
-  previousMillistry = millis();
-
-  BLERemoteService* pRemoteService = pClient->getService(serviceUUID);
-  if (pRemoteService == nullptr) {
-    Serial.println("Failed to find our service UUID: ");
-    Serial.println(serviceUUID.toString().c_str());
-    pClient->disconnect();
-    return false;
-  }
-
-  Serial.println(" - Found our service");
-  previousMillistry = millis();
-
-  pRemoteCharacteristic = pRemoteService->getCharacteristic(charUUID);
-  previousMillistry = millis();
-  pRemoteCharacteristicw = pRemoteService->getCharacteristic(charUUIDw);
-  if (pRemoteCharacteristic == nullptr) {
-    Serial.println("Failed to find our characteristic UUID: ");
-    Serial.println(charUUID.toString().c_str());
-    pClient->disconnect();
-    return false;
-  }
-  Serial.println(" - Found our characteristic");
-
-  previousMillistry = millis();
-  if (pRemoteCharacteristic->canNotify())
-    pRemoteCharacteristic->registerForNotify(notifyCallback);
-
-  doConnect_ble = false;
-  return true;
-}
-
-void WiFiStationConnected(WiFiEvent_t event, WiFiEventInfo_t info) {
+void wifiStationConnected(WiFiEvent_t event, WiFiEventInfo_t info) {
   Serial.println("Connected to WIFI successfully!");
-  MBServer.begin();
-  setup_ble();
+  modbus_tcp_server.begin();
+  setupBleConnection();
 }
 
-void WiFiGotIP(WiFiEvent_t event, WiFiEventInfo_t info) {
+void wifiGotIP(WiFiEvent_t event, WiFiEventInfo_t info) {
   Serial.print("IP address: ");
   Serial.print(WiFi.localIP());
   Serial.print(":");
@@ -338,21 +622,22 @@ void WiFiGotIP(WiFiEvent_t event, WiFiEventInfo_t info) {
   Serial.println("Modbus TCP/IP Online");
 }
 
-void WiFiStationDisconnected(WiFiEvent_t event, WiFiEventInfo_t info) {
+void wifiStationDisconnected(WiFiEvent_t event, WiFiEventInfo_t info) {
   Serial.println("Disconnected from WiFi access point");
   Serial.print("WiFi lost connection. Reason: ");
   Serial.println(info.wifi_sta_disconnected.reason);
+  wifi_disconnect_timestamp_ms = millis();
 }
 
-void setup_wifi_manager() {
+void setupWifiManager() {
   WiFi.disconnect(true);
 
   delay(1000);
 
-  WiFi.onEvent(WiFiStationConnected, ARDUINO_EVENT_WIFI_STA_CONNECTED);
-  WiFi.onEvent(WiFiGotIP, ARDUINO_EVENT_WIFI_STA_GOT_IP);
-  WiFi.onEvent(WiFiStationDisconnected, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
-
+  WiFi.onEvent(wifiStationConnected, ARDUINO_EVENT_WIFI_STA_CONNECTED);
+  WiFi.onEvent(wifiGotIP, ARDUINO_EVENT_WIFI_STA_GOT_IP);
+  WiFi.onEvent(wifiStationDisconnected, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+  
   WiFiManager wm;
   wm.setConnectTimeout(300);
 
@@ -360,132 +645,78 @@ void setup_wifi_manager() {
   res = wm.autoConnect("ESP32_SAJ_MODBUS");
 
   if (!res)
-    Serial.println("Failed to connect");
+        Serial.println("Failed to connect");
   else
-    Serial.println("connected...yeey :)");
+      Serial.println("connected...yeey :)");
 }
 
-void setup_ble() {
-  /////////////////////  BLUFI  ///////////////////////
-  Serial.println("Starting Arduino BLE Client application...");
-  BLEDevice::init("");
-
-  BLEScan* pBLEScan = BLEDevice::getScan();
-  pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
-  pBLEScan->setInterval(1349);
-  pBLEScan->setWindow(449);
-  pBLEScan->setActiveScan(true);
-  pBLEScan->start(5000, false);
+void setupBleConnection() {
+  // Initialize the BLE manager
+  saj_ble_manager.initialize();
+  // Start scanning for SAJ inverter
+  saj_ble_manager.startScanning();
 }
 
 void setup() {
   Serial.begin(115200);
-  setup_wifi_manager();
+  setupWifiManager();
 }
 
 void loop() {
-  uint64_t currentMillis_wifi = millis();
-  // if WiFi is down, try reconnecting every CHECK_WIFI_TIME seconds
-  if ((WiFi.status() != WL_CONNECTED) && (currentMillis_wifi - previousMillis_wifi >=30000)) {
+  loop_iterations++;
+  Serial.print("loop_iteration number: ");
+  Serial.print(loop_iterations);
+  Serial.println("");
+
+  if ((WiFi.status() != WL_CONNECTED) && (millis() - wifi_disconnect_timestamp_ms >= WIFI_DISCONNECTED_UNTIL_RESET_TIMEOUT)) {
     Serial.println("Reset 3. No WiFi connectivity for more than 30 seconds");
     resetFunc();
   }
-
-  if (doConnect_ble) {
-    if (connectToServer_ble())
-      Serial.println("We are now connected to the BLE Server.");
-    else
-      Serial.println("We have failed to connect to the server; there is nothin more we will do.");
+  
+  // Update BLE connection manager state
+  saj_ble_manager.update();
+  
+  // Check if BLE is ready for Modbus communication
+  if (!saj_ble_manager.isConnected()) {
+    Serial.print("BLE Status: ");
+    Serial.println(saj_ble_manager.getStateString());
+    return; // Wait for BLE connection before processing Modbus requests
   }
 
-  if (connected_ble) {
-      client = MBServer.accept();
-      if (!client)
+  client = modbus_tcp_server.accept();
+  if (!client)
         return;
+  
+  // Modbus TCP/IP
+  while (client.connected()) {
+    if (client.available()) {
+      Serial.println("client.available");
+      std::vector<byte> modbus_request;
 
-      byte byteFN = MB_FC_NONE;
+      while (client.available())
+        modbus_request.push_back(client.read());
 
-      // Modbus TCP/IP
-      while (client.connected()) {
-      if (client.available()) {
-        Serial.println("client.available");
-        int i = 0;
-        while (client.available()) {
-          mosbus_request[i] = client.read();
-          i++;
-        }
-        client.clear();
-        Serial.println("TCP request received");
+      client.clear();
+      Serial.print("TCP request received. Length: ");
+      Serial.println(modbus_request.size());
 
-        waitingmessage = true;
-        ModbusTCPRequest request = ModbusTCPRequest::fromByteArray(mosbus_request);
-        request.printDebugInfo();
+      ModbusTCP request = ModbusTCP::fromByteArray(modbus_request);
+      request.printDebugInfo();
 
-        byteFN = mosbus_request[7];
+      ModbusBLERequest ble_request = ModbusBLERequest::fromModbusTCP(request);
+      modbus_tcp_response = ModbusTCPResponse::fromModbusTCP(request);
 
-        Serial.println("");
-        Serial.print("transaction_id: ");
-        Serial.print(transaction_id);
+      Serial.print("Sending read message to BT - FN: ");
+      Serial.println(request.getFunctionCode());
+      std::array<byte, 13> ble_request_array = ble_request.toByteArray();
+      print_array(ble_request_array.data(), sizeof(ble_request_array), "ble_request_array");
 
-        Serial.println("");
-        Serial.print("total_calls: ");
-        Serial.print(total_calls);
-        Serial.println("");
-
-        uint16_t crc = request.getModRTU_CRC();
-
-        unsigned char high_byte = crc >> 8;
-        unsigned char low_byte = crc & 0xFF;
-
-        int transaction_identifier = ((request.getTransactionIdentifierBytes()[0] << 8) +
-          (request.getTransactionIdentifierBytes()[1])) - 1;
-
-        byte transaction_identifier_hex[2];
-        transaction_identifier_hex[0] = (transaction_identifier & 0x0000ff00) >> 8;
-        transaction_identifier_hex[1] = transaction_identifier & 0x000000ff;
-
-        byte mosbus_request_final[13] = {
-        (byte) 77,
-          0,
-          transaction_id,
-          (byte) 9,
-          (byte) 50,
-          request.getUnitId(),  // modbus_unit_id
-          request.getFunctionCode(),  // modbus_function_code
-          request.getAddressBytes()[0],  // modbus_address
-          request.getAddressBytes()[1],  // modbus_address
-          request.getNumberRegistersBytes()[0],  // modbus_number_registers
-          request.getNumberRegistersBytes()[1],  // modbus_number_registers
-          (byte) low_byte,  // crc
-          (byte) high_byte  // crc
-        };
-
-        total_registros = ((request.getNumberRegistersBytes()[0] << 8) +
-          (request.getNumberRegistersBytes()[1]) * 2) + 3;
-
-        byte total_registros_hex[2];
-        total_registros_hex[0] = (total_registros & 0x0000ff00) >> 8;
-        total_registros_hex[1] = total_registros & 0x000000ff;
-
-        modbus_frame_response[0] = (byte) mosbus_request[0];
-        modbus_frame_response[1] = (byte) mosbus_request[1];
-        modbus_frame_response[2] = (byte) mosbus_request[2];
-        modbus_frame_response[3] = (byte) mosbus_request[3];
-        modbus_frame_response[4] = (byte) total_registros_hex[0];
-        modbus_frame_response[5] = (byte) total_registros_hex[1];
-        modbus_frame_response[6] = (byte) mosbus_request[6];
-        modbus_frame_response[7] = (byte) mosbus_request[7];
-
-        Serial.print("Sending read message to BT: ");
-        Serial.println(byteFN);
-        print_array(mosbus_request_final, sizeof(mosbus_request_final), "mosbus_request_final");
-
-        switch (byteFN) {
+      switch (request.getFunctionCode()) {
           case MB_FC_NONE:
             break;
 
-          case MB_FC_READ_REGISTERS:  // 03 Read Holding Registers
-
+        case MB_FC_READ_REGISTERS:  // 03 Read Holding Registers
+        case MB_FC_WRITE_REGISTER:  // 06 Write Holding Register
             // 50:   32 on hexadecimal view on the app
             // 1:    01 The unit identifier
             // 3:    03 The function code
@@ -495,24 +726,11 @@ void loop() {
             // 14:   0E length data
             // 1:    01 crc
             // 210:  D2 crc
-            pRemoteCharacteristicw->writeValue(mosbus_request_final, 13, true);
-            byteFN = MB_FC_NONE;
-            break;
+          if (!saj_ble_manager.writeToInverter(ble_request_array.data(), 13))
+            Serial.println("Failed to write to BLE characteristic");
 
-          case MB_FC_WRITE_REGISTER:  // 06 Write Holding Register
-            pRemoteCharacteristicw->writeValue(mosbus_request_final, 13, true);
-            byteFN = MB_FC_NONE;
-            break;
-          }
-
-          transaction_id++;
-          total_calls++;
-        }
+          break;
       }
-  } else if (doScan_ble) {
-    Serial.println("scanning again");
-
-    doConnect_ble = true;
-    connected_ble = false;
+    }
   }
 }
